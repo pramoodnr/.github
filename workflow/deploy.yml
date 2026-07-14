@@ -1,0 +1,43 @@
+name: Deploy to EKS
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["app/**", "k8s/**", "app/Dockerfile"]
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: dev-deployment
+  cancel-in-progress: false
+jobs:
+  deploy:
+    environment: dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push immutable image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          TAG: ${{ github.sha }}
+        run: |
+          IMAGE="$REGISTRY/$REPOSITORY:$TAG"
+          docker build -f app/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "${{ vars.AWS_REGION }}" --name "${{ vars.EKS_CLUSTER_NAME }}"
+      - name: Deploy
+        run: |
+          kubectl apply -k k8s/base
+          kubectl -n devops-portfolio set image deployment/portfolio-api api="$IMAGE"
+          kubectl -n devops-portfolio rollout status deployment/portfolio-api --timeout=5m
+      - name: Smoke test
+        run: kubectl -n devops-portfolio run smoke-${{ github.run_id }} --rm -i --restart=Never --image=curlimages/curl:8.11.1 -- curl -fsS http://portfolio-api/health
